@@ -1,11 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -40,10 +40,11 @@ type WeatherAPIConfig struct {
 	RetryAttempts int
 	CacheTTL      time.Duration
 	RequestDelay  time.Duration
+	MaxCacheSize  int64
 }
 
 type WeatherProvider interface {
-	GetWeather() (*WeatherData, error)
+	GetWeather(ctx context.Context) (*WeatherData, error)
 	Name() string
 }
 
@@ -58,12 +59,14 @@ type FreeWeatherAPI struct {
 	Client         *http.Client
 	openMeteoCodes map[int]string
 	providers      []WeatherProvider
+	cacheSize      int64
+	cacheMu        sync.RWMutex
 }
 
 type OpenMeteoProvider struct {
-	api        *FreeWeatherAPI
-	codes      map[int]string
-	timezone   string
+	api      *FreeWeatherAPI
+	codes    map[int]string
+	timezone string
 }
 
 type WeatherAPIProvider struct {
@@ -100,7 +103,7 @@ func (p *OpenMeteoProvider) Name() string {
 	return "Open-Meteo"
 }
 
-func (p *OpenMeteoProvider) GetWeather() (*WeatherData, error) {
+func (p *OpenMeteoProvider) GetWeather(ctx context.Context) (*WeatherData, error) {
 	apiURL := "https://api.open-meteo.com/v1/forecast"
 	params := map[string]string{
 		"latitude":  fmt.Sprintf("%f", p.api.Latitude),
@@ -109,7 +112,7 @@ func (p *OpenMeteoProvider) GetWeather() (*WeatherData, error) {
 		"timezone":  p.timezone,
 	}
 
-	data, err := p.api.makeRequest(apiURL, params)
+	data, err := p.api.makeRequest(ctx, apiURL, params)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +171,7 @@ func (p *WeatherAPIProvider) Name() string {
 	return "WeatherAPI"
 }
 
-func (p *WeatherAPIProvider) GetWeather() (*WeatherData, error) {
+func (p *WeatherAPIProvider) GetWeather(ctx context.Context) (*WeatherData, error) {
 	if p.api.WeatherAPIKey == "" {
 		return nil, fmt.Errorf("WeatherAPI key not configured")
 	}
@@ -180,7 +183,7 @@ func (p *WeatherAPIProvider) GetWeather() (*WeatherData, error) {
 		"aqi": "no",
 	}
 
-	data, err := p.api.makeRequest(apiURL, params)
+	data, err := p.api.makeRequest(ctx, apiURL, params)
 	if err != nil {
 		return nil, err
 	}
@@ -239,14 +242,14 @@ func (p *WttrInProvider) Name() string {
 	return "wttr.in"
 }
 
-func (p *WttrInProvider) GetWeather() (*WeatherData, error) {
+func (p *WttrInProvider) GetWeather(ctx context.Context) (*WeatherData, error) {
 	encodedCity := url.QueryEscape(p.api.City)
 	apiURL := fmt.Sprintf("https://wttr.in/%s", encodedCity)
 	params := map[string]string{
 		"format": "j1",
 	}
 
-	data, err := p.api.makeRequest(apiURL, params)
+	data, err := p.api.makeRequest(ctx, apiURL, params)
 	if err != nil {
 		return nil, err
 	}
@@ -350,6 +353,7 @@ func NewFreeWeatherAPI(city string, lat, lon float64, enableCache bool) *FreeWea
 			RetryAttempts: 2,
 			CacheTTL:      3600 * time.Second,
 			RequestDelay:  500 * time.Millisecond,
+			MaxCacheSize:  50 * 1024 * 1024,
 		},
 	}
 
@@ -411,25 +415,105 @@ func (w *FreeWeatherAPI) getCacheKey(requestURL string, params map[string]string
 	return fmt.Sprintf("%x.json", hash[:8])
 }
 
-func (w *FreeWeatherAPI) cacheResponse(requestURL string, params map[string]string, data []byte) error {
+func (w *FreeWeatherAPI) updateCacheSize() {
+	w.cacheMu.Lock()
+	defer w.cacheMu.Unlock()
+
+	var total int64
+	filepath.Walk(w.CacheDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	w.cacheSize = total
+}
+
+func (w *FreeWeatherAPI) enforceCacheLimit() error {
+	if w.cacheSize <= w.Config.MaxCacheSize {
+		return nil
+	}
+
+	files, err := filepath.Glob(filepath.Join(w.CacheDir, "*.json"))
+	if err != nil {
+		return err
+	}
+
+	type fileInfo struct {
+		path    string
+		modTime time.Time
+		size    int64
+	}
+
+	fileInfos := make([]fileInfo, 0, len(files))
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		fileInfos = append(fileInfos, fileInfo{
+			path:    file,
+			modTime: info.ModTime(),
+			size:    info.Size(),
+		})
+	}
+
+	for i := 0; i < len(fileInfos)-1; i++ {
+		for j := i + 1; j < len(fileInfos); j++ {
+			if fileInfos[i].modTime.After(fileInfos[j].modTime) {
+				fileInfos[i], fileInfos[j] = fileInfos[j], fileInfos[i]
+			}
+		}
+	}
+
+	for w.cacheSize > w.Config.MaxCacheSize && len(fileInfos) > 0 {
+		oldest := fileInfos[0]
+		if err := os.Remove(oldest.path); err == nil {
+			w.cacheSize -= oldest.size
+		}
+		fileInfos = fileInfos[1:]
+	}
+
+	return nil
+}
+
+func (w *FreeWeatherAPI) cacheResponse(ctx context.Context, requestURL string, params map[string]string, data []byte) error {
 	if !w.EnableCache {
 		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	cacheKey := w.getCacheKey(requestURL, params)
 	cacheFile := filepath.Join(w.CacheDir, cacheKey)
 
 	tempFile := cacheFile + ".tmp"
-	if err := ioutil.WriteFile(tempFile, data, 0644); err != nil {
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
 		return err
 	}
 
-	return os.Rename(tempFile, cacheFile)
+	if err := os.Rename(tempFile, cacheFile); err != nil {
+		os.Remove(tempFile)
+		return err
+	}
+
+	w.updateCacheSize()
+	return w.enforceCacheLimit()
 }
 
-func (w *FreeWeatherAPI) loadCachedResponse(requestURL string, params map[string]string) ([]byte, error) {
+func (w *FreeWeatherAPI) loadCachedResponse(ctx context.Context, requestURL string, params map[string]string) ([]byte, error) {
 	if !w.EnableCache {
 		return nil, fmt.Errorf("cache disabled")
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 
 	cacheKey := w.getCacheKey(requestURL, params)
@@ -442,6 +526,7 @@ func (w *FreeWeatherAPI) loadCachedResponse(requestURL string, params map[string
 
 	if time.Since(info.ModTime()) > w.Config.CacheTTL {
 		os.Remove(cacheFile)
+		w.updateCacheSize()
 		return nil, fmt.Errorf("cache expired")
 	}
 
@@ -453,33 +538,42 @@ func (w *FreeWeatherAPI) loadCachedResponse(requestURL string, params map[string
 	return data, nil
 }
 
-func (w *FreeWeatherAPI) CleanOldCache() error {
+func (w *FreeWeatherAPI) CleanOldCache(ctx context.Context) error {
 	if !w.EnableCache {
 		return nil
 	}
 
 	return filepath.Walk(w.CacheDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			return nil
 		}
 		if info.IsDir() {
 			return nil
 		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if time.Since(info.ModTime()) > w.Config.CacheTTL {
-			os.Remove(path)
+			if removeErr := os.Remove(path); removeErr == nil {
+				w.updateCacheSize()
+			}
 		}
 		return nil
 	})
 }
 
-func (w *FreeWeatherAPI) makeRequest(requestURL string, params map[string]string) ([]byte, error) {
+func (w *FreeWeatherAPI) makeRequest(ctx context.Context, requestURL string, params map[string]string) ([]byte, error) {
 	if w.EnableCache {
-		if data, err := w.loadCachedResponse(requestURL, params); err == nil && data != nil {
+		if data, err := w.loadCachedResponse(ctx, requestURL, params); err == nil && data != nil {
 			return data, nil
 		}
 	}
 
-	req, err := http.NewRequest("GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -495,36 +589,63 @@ func (w *FreeWeatherAPI) makeRequest(requestURL string, params map[string]string
 
 	var lastErr error
 	for attempt := 0; attempt <= w.Config.RetryAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		resp, err := w.Client.Do(req)
 		if err != nil {
+			lastErr = err
 			if attempt == w.Config.RetryAttempts {
 				return nil, fmt.Errorf("after %d attempts: %w", w.Config.RetryAttempts, err)
 			}
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			if attempt == w.Config.RetryAttempts {
 				return nil, fmt.Errorf("HTTP %d after %d attempts", resp.StatusCode, w.Config.RetryAttempts)
 			}
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		data, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
+			lastErr = err
 			if attempt == w.Config.RetryAttempts {
 				return nil, fmt.Errorf("failed to read response after %d attempts: %w", w.Config.RetryAttempts, err)
 			}
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		if w.EnableCache {
-			w.cacheResponse(requestURL, params, data)
+			w.cacheResponse(ctx, requestURL, params, data)
 		}
 
 		return data, nil
@@ -557,40 +678,63 @@ func (w *FreeWeatherAPI) validateWeatherData(data WeatherData) bool {
 
 func (w *FreeWeatherAPI) GetAllWeatherData() map[string]*WeatherData {
 	results := make(map[string]*WeatherData)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	providerSet := make(map[string]bool)
 	for _, provider := range w.providers {
+		if providerSet[provider.Name()] {
+			continue
+		}
+		providerSet[provider.Name()] = true
+
 		wg.Add(1)
 		go func(p WeatherProvider) {
 			defer wg.Done()
 
-			if data, err := p.GetWeather(); err == nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if data, err := p.GetWeather(ctx); err == nil {
 				mu.Lock()
 				results[p.Name()] = data
 				mu.Unlock()
 			}
 
-			time.Sleep(w.Config.RequestDelay)
+			timer := time.NewTimer(w.Config.RequestDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+			}
 		}(provider)
 	}
 
 	wg.Wait()
 
 	if w.EnableCache {
-		w.CleanOldCache()
+		go func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			w.CleanOldCache(cleanupCtx)
+		}()
 	}
 
 	return results
 }
 
-func getCoordinatesFromCity(city string) (*Coordinates, error) {
+func getCoordinatesFromCity(ctx context.Context, city string) (*Coordinates, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	apiURL := fmt.Sprintf("https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1", url.QueryEscape(city))
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +917,11 @@ func fetchWeatherInteractive() {
 	}
 
 	fmt.Printf("\nLooking up coordinates for %s...\n", city)
-	coords, err := getCoordinatesFromCity(city)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	coords, err := getCoordinatesFromCity(ctx, city)
 	if err != nil {
 		fmt.Printf("Error: Could not find coordinates for '%s'\n", city)
 		fmt.Println("Please check the city name and try again.")
@@ -860,7 +1008,11 @@ func viewRawData() {
 	}
 
 	fmt.Printf("\nLooking up coordinates for %s...\n", city)
-	coords, err := getCoordinatesFromCity(city)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	coords, err := getCoordinatesFromCity(ctx, city)
 	if err != nil {
 		fmt.Printf("Error: Could not find coordinates for '%s'\n", city)
 		fmt.Println("Please check the city name and try again.")
@@ -880,6 +1032,22 @@ func viewRawData() {
 	displayRawData(results, coords.City)
 
 	fmt.Print("Press Enter to return to menu...")
+	fmt.Scanln()
+}
+
+func clearCache() {
+	printHeader()
+	
+	cacheDir := ".weather_cache"
+	if err := os.RemoveAll(cacheDir); err != nil {
+		fmt.Printf("Error clearing cache: %v\n", err)
+	} else {
+		fmt.Println("Cache cleared successfully.")
+		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			fmt.Printf("Warning: Could not recreate cache directory: %v\n", err)
+		}
+	}
+	fmt.Print("Press Enter to continue...")
 	fmt.Scanln()
 }
 
@@ -908,15 +1076,7 @@ func mainMenu() {
 		case "3":
 			viewRawData()
 		case "4":
-			printHeader()
-			cacheDir := ".weather_cache"
-			if err := os.RemoveAll(cacheDir); err != nil {
-				fmt.Printf("Error clearing cache: %v\n", err)
-			} else {
-				fmt.Println("Cache cleared successfully.")
-			}
-			fmt.Print("Press Enter to continue...")
-			fmt.Scanln()
+			clearCache()
 		case "5":
 			fmt.Println("\nThank you for using Weather Dashboard!")
 			fmt.Println("Goodbye!")
